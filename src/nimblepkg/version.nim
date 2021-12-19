@@ -75,6 +75,14 @@ proc `<`*(ver: Version, ver2: Version): bool =
     else:
       return false
 
+proc min*(ver: Version, ver2: Version): Version =
+  if ver < ver2: ver
+  else: ver2
+
+proc max*(ver: Version, ver2: Version): Version =
+  if ver > ver2: ver
+  else: ver2
+
 proc `==`*(ver: Version, ver2: Version): bool =
   if ver.isSpecial or ver2.isSpecial:
     return ($ver).toLowerAscii() == ($ver2).toLowerAscii()
@@ -251,6 +259,49 @@ proc `$`*(verRange: VersionRange): string =
 
   result.add(string(verRange.ver))
 
+proc refine*(input_a, input_b: VersionRange): VersionRange =
+  var
+    a = input_a
+    b = input_b
+  if a.kind > b.kind: swap(a, b)
+
+  if b.kind == verEq or b.kind == verSpecial:
+    # Eq & Special are handled elsewhere
+    # Ignore them during refining
+    return a
+  if b.kind == verAny:
+    return a
+
+  case a.kind
+  of verEqLater, verLater:
+    case b.kind:
+    of verLater, verEqLater:
+      if a.ver > b.ver: a
+      else: b
+    of verEarlier, verEqEarlier:
+      VersionRange(kind: verIntersect, verILeft: a, verIRight: b)
+    of verIntersect:
+      VersionRange(kind: verIntersect, verILeft: if a.ver > b.verILeft.ver: a else: b.verILeft, verIRight: b.verIRight)
+    else: raise newException(Defect, "?")
+
+  of verEarlier, verEqEarlier:
+    case b.kind:
+    of verEarlier, verEqEarlier:
+      if a.ver < b.ver: a
+      else: b
+    of verEqLater:
+      VersionRange(kind: verIntersect, verILeft: b, verIRight: a)
+    of verIntersect:
+      VersionRange(kind: verIntersect, verILeft: b.verILeft, verIRight: if a.ver < b.verIRight.ver: a else: b.verIRight)
+    else: raise newException(Defect, "?")
+
+  of verIntersect:
+    case b.kind:
+    of verIntersect:
+      VersionRange(kind: verIntersect, verILeft: min(a.verILeft, b.verILeft), verIRight: max(a.verIRight, b.verIRight))
+    else: raise newException(Defect, "?")
+  else: raise newException(Defect, "?")
+
 proc getSimpleString*(verRange: VersionRange): string =
   ## Gets a string with no special symbols and spaces. Used for dir name
   ## creation in tools.nim
@@ -357,5 +408,27 @@ when isMainModule:
 
   # Something raised on IRC
   doAssert newVersion("1") == newVersion("1.0")
+
+  doAssert min(newVersion("1"), newVersion("2")) == newVersion("1")
+  doAssert min(newVersion("2"), newVersion("1")) == newVersion("1")
+  doAssert max(newVersion("1"), newVersion("2")) == newVersion("2")
+  doAssert max(newVersion("2"), newVersion("1")) == newVersion("2")
+
+  doAssert refine(parseVersionRange("< 10"), parseVersionRange(" > 0")) == parseVersionRange("> 0 & < 10")
+  doAssert refine(parseVersionRange(">= 0"), parseVersionRange(" < 10")) == parseVersionRange(">= 0 & < 10")
+  doAssert refine(parseVersionRange("> 0"), parseVersionRange(" <= 10")) == parseVersionRange("> 0 & <= 10")
+  doAssert refine(parseVersionRange(">= 0"), parseVersionRange(" <= 10")) == parseVersionRange(">= 0 & <= 10")
+
+  doAssert refine(parseVersionRange("> 0"), parseVersionRange("> 5")) == parseVersionRange("> 5")
+  doAssert refine(parseVersionRange("< 1"), parseVersionRange("< 5")) == parseVersionRange("< 1")
+
+  doAssert refine(parseVersionRange("> 5 & < 10"), parseVersionRange("< 6")) == parseVersionRange("> 5 & < 6")
+
+  doAssert refine(parseVersionRange("> 5 & < 6"), parseVersionRange("< 10")) == parseVersionRange("> 5 & < 6")
+
+  doAssert refine(parseVersionRange("> 5 & < 10"), parseVersionRange(">= 6")) == parseVersionRange(">= 6 & < 10")
+  doAssert refine(parseVersionRange("> 6 & < 10"), parseVersionRange("> 5")) == parseVersionRange("> 6 & < 10")
+
+  doAssert refine(parseVersionRange("> 6 & < 10"), parseVersionRange("> 5 & < 8")) == parseVersionRange("> 6 & < 8")
 
   echo("Everything works!")
