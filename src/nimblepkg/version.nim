@@ -75,14 +75,6 @@ proc `<`*(ver: Version, ver2: Version): bool =
     else:
       return false
 
-proc min*(ver: Version, ver2: Version): Version =
-  if ver < ver2: ver
-  else: ver2
-
-proc max*(ver: Version, ver2: Version): Version =
-  if ver > ver2: ver
-  else: ver2
-
 proc `==`*(ver: Version, ver2: Version): bool =
   if ver.isSpecial or ver2.isSpecial:
     return ($ver).toLowerAscii() == ($ver2).toLowerAscii()
@@ -119,6 +111,13 @@ proc `==`*(range1: VersionRange, range2: VersionRange): bool =
   of verIntersect:
     range1.verILeft == range2.verILeft and range1.verIRight == range2.verIRight
   of verAny: true
+
+proc `<`*(range1: VersionRange, range2: VersionRange): bool =
+  assert range1.kind <= verIntersect and range2.kind <= verIntersect
+  range1.ver < range2.ver
+
+proc `<=`*(ver: VersionRange, ver2: VersionRange): bool =
+  return (ver == ver2) or (ver < ver2)
 
 proc withinRange*(ver: Version, ran: VersionRange): bool =
   case ran.kind
@@ -272,35 +271,37 @@ proc refine*(input_a, input_b: VersionRange): VersionRange =
   if b.kind == verAny:
     return a
 
-  case a.kind
-  of verEqLater, verLater:
-    case b.kind:
-    of verLater, verEqLater:
-      if a.ver > b.ver: a
-      else: b
+  result = case a.kind
+    of verEqLater, verLater:
+      case b.kind:
+      of verLater, verEqLater:
+        max(a, b)
+      of verEarlier, verEqEarlier:
+        VersionRange(kind: verIntersect, verILeft: a, verIRight: b)
+      of verIntersect:
+        VersionRange(kind: verIntersect, verILeft: max(a, b.verILeft), verIRight: b.verIRight)
+      else: raise newException(Defect, "?")
+
     of verEarlier, verEqEarlier:
-      VersionRange(kind: verIntersect, verILeft: a, verIRight: b)
+      case b.kind:
+      of verEarlier, verEqEarlier:
+        min(a, b)
+      of verEqLater:
+        VersionRange(kind: verIntersect, verILeft: b, verIRight: a)
+      of verIntersect:
+        VersionRange(kind: verIntersect, verILeft: b.verILeft, verIRight: min(a, b.verIRight))
+      else: raise newException(Defect, "?")
+
     of verIntersect:
-      VersionRange(kind: verIntersect, verILeft: if a.ver > b.verILeft.ver: a else: b.verILeft, verIRight: b.verIRight)
+      case b.kind:
+      of verIntersect:
+        VersionRange(kind: verIntersect, verILeft: max(a.verILeft, b.verILeft), verIRight: min(a.verIRight, b.verIRight))
+      else: raise newException(Defect, "?")
     else: raise newException(Defect, "?")
 
-  of verEarlier, verEqEarlier:
-    case b.kind:
-    of verEarlier, verEqEarlier:
-      if a.ver < b.ver: a
-      else: b
-    of verEqLater:
-      VersionRange(kind: verIntersect, verILeft: b, verIRight: a)
-    of verIntersect:
-      VersionRange(kind: verIntersect, verILeft: b.verILeft, verIRight: if a.ver < b.verIRight.ver: a else: b.verIRight)
-    else: raise newException(Defect, "?")
-
-  of verIntersect:
-    case b.kind:
-    of verIntersect:
-      VersionRange(kind: verIntersect, verILeft: min(a.verILeft, b.verILeft), verIRight: max(a.verIRight, b.verIRight))
-    else: raise newException(Defect, "?")
-  else: raise newException(Defect, "?")
+  if result.kind == verIntersect:
+    if result.verILeft.ver > result.verIRight.ver:
+      raise newException(NimbleError, "Can't refine range")
 
 proc getSimpleString*(verRange: VersionRange): string =
   ## Gets a string with no special symbols and spaces. Used for dir name
@@ -409,10 +410,13 @@ when isMainModule:
   # Something raised on IRC
   doAssert newVersion("1") == newVersion("1.0")
 
-  doAssert min(newVersion("1"), newVersion("2")) == newVersion("1")
+  doAssert min(newVersion("1.2"), newVersion("2.0")) == newVersion("1.2")
   doAssert min(newVersion("2"), newVersion("1")) == newVersion("1")
   doAssert max(newVersion("1"), newVersion("2")) == newVersion("2")
   doAssert max(newVersion("2"), newVersion("1")) == newVersion("2")
+
+  doAssert min(parseVersionRange("< 10"), parseVersionRange("< 8")) == parseVersionRange("< 8")
+  doAssert max(parseVersionRange("< 10"), parseVersionRange("< 8")) == parseVersionRange("< 10")
 
   doAssert refine(parseVersionRange("< 10"), parseVersionRange(" > 0")) == parseVersionRange("> 0 & < 10")
   doAssert refine(parseVersionRange(">= 0"), parseVersionRange(" < 10")) == parseVersionRange(">= 0 & < 10")
@@ -430,5 +434,12 @@ when isMainModule:
   doAssert refine(parseVersionRange("> 6 & < 10"), parseVersionRange("> 5")) == parseVersionRange("> 6 & < 10")
 
   doAssert refine(parseVersionRange("> 6 & < 10"), parseVersionRange("> 5 & < 8")) == parseVersionRange("> 6 & < 8")
+
+  try:
+    discard refine(parseVersionRange("> 6"), parseVersionRange("< 5"))
+    doAssert false
+  except NimbleError:
+    doAssert true
+
 
   echo("Everything works!")

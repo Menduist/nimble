@@ -44,9 +44,6 @@ proc refresh(options: Options) =
     for name, list in options.config.packageLists:
       fetchList(list, options)
 
-#proc install(packages: seq[PkgTuple],
-#             options: Options,
-#             doPrompt = true): tuple[deps: seq[PackageInfo], pkg: PackageInfo]
 proc processDeps(pkginfo: PackageInfo, options: Options): seq[PackageInfo] =
   ## Verifies and installs dependencies.
   ##
@@ -259,8 +256,7 @@ proc vcsRevisionInDir(dir: string): string =
       discard
 
 proc installFromDir(dir: string, options: Options,
-                    paths: seq[string],
-                    url: string): PackageInfo =
+                    paths: seq[string], url: string, pkgInfo: var PackageInfo) =
   ## Returns where package has been installed to, together with paths
   ## to the packages this package depends on.
   ## The return value of this function is used by
@@ -272,19 +268,13 @@ proc installFromDir(dir: string, options: Options,
       if not execHook(options, actionInstall, true):
         raise newException(NimbleError, "Pre-hook prevented further execution.")
 
-  var pkgInfo = getPkgInfo(dir, options)
   let realDir = pkgInfo.getRealDir()
   let binDir = options.getBinDir()
   var depsOptions = options
   depsOptions.depsOnly = false
 
-  # Overwrite the version if the requested version is "#head" or similar.
-  #if requestedVer.kind == verSpecial:
-  #  pkgInfo.specialVersion = $requestedVer.spe
-
   if options.depsOnly:
-    result = pkgInfo
-    return result
+    return
 
   display("Installing", "$1@$2" % [pkginfo.name, pkginfo.specialVersion],
           priority = HighPriority)
@@ -382,8 +372,6 @@ proc installFromDir(dir: string, options: Options,
   pkgInfo.isInstalled = true
 
   # Return the dependencies of this package (mainly for paths).
-  result = pkgInfo
-
   display("Success:", pkgInfo.name & " installed successfully.",
           Success, HighPriority)
 
@@ -421,7 +409,7 @@ proc getDownloadInfo*(pv: PkgTuple, options: Options,
 
 proc installIteration(packages: seq[PkgTuple],
              options: Options,
-             doPrompt = true) =
+             doPrompt = true): seq[PackageInfo] =
   type
     InstallConstraint =
       tuple[
@@ -438,46 +426,81 @@ proc installIteration(packages: seq[PkgTuple],
 
   var
     pkgList = getInstalledPkgsMin(options.getPkgsDir(), options)
-    installConstraints: Table[string, seq[InstallConstraint]] = packages.mapIt((it.name, @[("cli", it.ver)])).toTable()
+    installConstraints: Table[string, seq[InstallConstraint]]
     dependencies: Table[string, seq[string]]
     installInfo: Table[string, InstallInfo]
-    toProcess = packages.mapIt(it.name)
+    toProcess: seq[string]
+
+  for package in packages:
+    let constraintTuple = (package.name, package.ver)
+    if package.name in installConstraints:
+      installConstraints[package.name] &= constraintTuple
+    else:
+      installConstraints[package.name] = @[constraintTuple]
+      toProcess.add(package.name)
 
   # For each thing to install:
   # - Create a version range using all constraints
   # - Get all deps, add constraint on each of them
-  # - If a dep has already been downloaded, and we have a new incompatible
+  # - If a dep has already been installed, and we have a new incompatible
   #   constraint, put it back in the list
   while toProcess.len > 0:
-    let
-      packageName = toProcess[0]
-      packageConstraints = installConstraints[packageName]
+    var packageName = toProcess[0]
+    let packageConstraints = installConstraints[packageName]
     toProcess.delete(0)
 
-    var packageVersion = packageConstraints[0].version
-    for i in 1..<packageConstraints.len:
-      #TODO handle special versions
-      packageVersion = packageVersion.refine(packageConstraints[i].version)
+    display("Checking",
+            "$1 required by: $2" % [packageName, packageConstraints.mapIt(it.source & " (" & $it.version & ")").join(", ")],
+            priority = HighPriority)
 
-    
-    echo packageName, ": ", packageVersion, " (", packageConstraints, ")"
+    # Compute versions constraints
+    var
+      combinedVersion = none(VersionRange)
+      specialVersion = none(VersionRange)
+    try:
+      for constraint in packageConstraints:
+        if constraint.version.kind == verSpecial:
+          specialVersion =
+            some(if specialVersion.isSome and specialVersion.get() != constraint.version:
+              raise newException(NimbleError, "")
+            else:
+              constraint.version)
+        else:
+          combinedVersion =
+            some(if combinedVersion.isSome:
+              combinedVersion.get().refine(constraint.version)
+            else:
+              constraint.version)
+    except NimbleError:
+      raise newException(NimbleError, "Cannot satisfy the dependencies on $1" % [packageName])
 
-    let pkgTuple = (name: packageName, ver: packageVersion)
+    var pkgTuple = (
+      name: packageName,
+      ver: if specialVersion.isSome: specialVersion.get() else: combinedVersion.get()
+    )
 
     var package: PackageInfo
 
     if packageName in dependencies:
       # We already have ran this package once
       # clean it up from previous dependencies
+      # and remove no longer used packages
+      var noLongerRequired: seq[string]
       for otherPackage in dependencies[packageName]:
         installConstraints[otherPackage].keepItIf(it.source != packageName)
-        #TODO if len == 0: remove package
+        if installConstraints[otherPackage].len == 0:
+          noLongerRequired.add(otherPackage)
       dependencies.del(packageName)
+      for otherPackage in noLongerRequired:
+        dependencies.del(otherPackage)
+        installInfo.del(otherPackage)
+        installConstraints.del(otherPackage)
 
     # Not already installed?
     var
       downloadDir: string
       downloadVersion: Version
+
     if not pkgList.findPkg(pkgTuple, package):
       # Download it to get it's metadata
       let (meth, url, metadata) = getDownloadInfo(pkgTuple, options, doPrompt)
@@ -488,31 +511,45 @@ proc installIteration(packages: seq[PkgTuple],
 
     if package.name != packageName:
       # We resolved the real package name
+
+      # We have to replace the old name
+      for otherDep in dependencies.keys():
+        dependencies[otherDep].applyIt(if it == packageName: package.name else: it)
+
+      installConstraints.del(packageName)
+
       if package.name in installConstraints:
-        installConstraints[package.name] &= installConstraints[packageName]
+        installConstraints[package.name] &= packageConstraints
 
         if package.name in installInfo and package.name notin toProcess:
           let currentVersion = installInfo[package.name].version
           # Check that our constraints are compatible
           # otherwise, recompute this package
-          for constraint in installConstraints[packageName]:
+          for constraint in packageConstraints:
             if not currentVersion.withinRange(constraint.version):
               toProcess.add(package.name)
               break
-
+        continue
       else:
-        installConstraints[package.name] = installConstraints[packageName]
-        toProcess.insert(package.name, 0)
-        #TODO avoid downloading twice
+        # This is the first time we hear about this package
+        # let's continue after renaming it correctly
+        packageName = package.name
+        installConstraints[packageName] = packageConstraints
+        pkgTuple.name = packageName
 
-      # We have to replace the oldname everywhere
-      for otherDep in dependencies.keys():
-        dependencies[otherDep].applyIt(if it == packageName: package.name else: it)
-
-      installConstraints.del(packageName)
-      continue
+        if pkgList.findPkg(pkgTuple, package):
+          # The resolved package is already installed
+          downloadDir = ""
 
     package = package.toFullInfo(options)
+
+    # If we used a special version, check that the combined constraints
+    # are also compatible
+    if combinedVersion.isSome and not package.version.Version.withinRange(combinedVersion.get()):
+      raise newException(NimbleError, "Cannot satisfy the dependencies on $1" % [packageName])
+
+    if specialVersion.isSome:
+      package.specialVersion = $specialVersion.get()
 
     installInfo[packageName] = (package: package, version: package.version.Version, downloadDir: downloadDir)
 
@@ -569,15 +606,17 @@ proc installIteration(packages: seq[PkgTuple],
       depPaths.add(installInfo[dep].package.getRealDir())
     if packageName in toProcess: continue
 
-    # Already installed
-    # We have to do this after the dependency solver
-    if installInfo[packageName].downloadDir.len == 0: continue
+    if installInfo[packageName].downloadDir.len == 0:
+      # Already installed
+      # We have to do this after the dependency solver
+      continue
 
-    installInfo[packageName].package =
-      installFromDir(installInfo[packageName].downloadDir, options, depPaths, "")
+    # This will save output data to package directly
+    installFromDir(installInfo[packageName].downloadDir, options, depPaths, "", installInfo[packageName].package)
+    result.add installInfo[packageName].package
 
-  #echo installConstraints
-  #echo installInfo
+    for dep in dependencies[packageName]:
+      addRevDep(options.nimbleData, (dep, $installInfo[dep].version), installInfo[packageName].package)
 
 #proc install(packages: seq[PkgTuple],
 #             options: Options,
@@ -1319,7 +1358,7 @@ proc doAction(options: var Options) =
     #          Warning, HighPriority)
     #  for i in 0..<pkgInfo.foreignDeps.len:
     #    display("Hint:", "  " & pkgInfo.foreignDeps[i], Warning, HighPriority)
-    installIteration(options.action.packages, options)
+    discard installIteration(options.action.packages, options)
   of actionUninstall:
     uninstall(options)
   of actionSearch:
